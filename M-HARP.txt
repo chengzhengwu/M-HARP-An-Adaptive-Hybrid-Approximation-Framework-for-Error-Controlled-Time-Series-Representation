@@ -1,0 +1,1853 @@
+package io.github.xkitsios;
+
+
+import com.github.luben.zstd.Zstd;
+import org.apache.poi.ss.usermodel.Row;
+import org.apache.poi.ss.usermodel.Sheet;
+import org.apache.poi.ss.usermodel.Workbook;
+import org.apache.poi.xssf.usermodel.XSSFWorkbook;
+
+import java.util.concurrent.ExecutorService;
+
+import java.io.*;
+import java.util.*;
+import java.util.concurrent.*;
+
+public class M_HARP {
+    private static ArrayList<FastSegment> perBSegments;
+    private static ArrayList<FastSegment> perASegments;
+    private static ArrayList<FastSegment> restSegments;
+    private static double epsilon;
+    private static int globalMinB;
+    private static long lastTimeStamp;
+
+    private static final int MAGIC1 = 0x46; // 'F'
+    private static final int MAGIC2 = 0x50; // 'P'
+    // v3 = adds FLAGS byte for forward-compat (FP64 etc.)
+    private static final int FORMAT_VERSION = 3;
+
+    // ====== NEW: active config (reviewer-driven switches; default = legacy behavior) ======
+    private static volatile M_HARP.Config ACTIVE_CFG = new M_HARP.Config();
+
+    // ====== Flags byte in v3 header ======
+    private static final int FLAG_TS_BASE_DELTA = 1 << 0;
+
+    private static final int MODE_GROUPED    = 0; // 你现在的 perB/perA/rest
+    private static final int MODE_SEQUENTIAL = 1; // 新增：顺序段流
+
+    // Note: CompressResult is defined later in this file (after SegmentResult).
+    // See line ~810. The forward reference is legal here because both are static nested classes.
+
+
+    private static final boolean ENABLE_POST_MERGE = false;
+
+    private static void writeVarLong(long v, ByteArrayOutputStream out) {
+        // 无符号右移，直到剩余 < 0x80
+        while ((v & ~0x7FL) != 0L) {
+            out.write((int) ((v & 0x7F) | 0x80));
+            v >>>= 7;
+        }
+        out.write((int) v);
+    }
+
+    private static long readVarLong(ByteArrayInputStream in) throws IOException {
+        long result = 0;
+        int shift = 0;
+        while (shift < 64) {
+            int b = in.read();
+            if (b < 0) throw new IOException("EOF while reading varlong");
+            result |= ((long) (b & 0x7F)) << shift;
+            if ((b & 0x80) == 0) return result;
+            shift += 7;
+        }
+        throw new IOException("VarLong too long / corrupted");
+    }
+
+
+    private static long zigzagEncodeIntToLong(int x) {
+        return (((long) x) << 1) ^ (((long) x) >> 31);
+    }
+    private static int zigzagDecodeLongToInt(long u) {
+        return (int) ((u >>> 1) ^ -(u & 1L));
+    }
+
+    private static void writeZigZagInt(int x, ByteArrayOutputStream out) {
+        writeVarLong(zigzagEncodeIntToLong(x), out);
+    }
+    private static int readZigZagInt(ByteArrayInputStream in) throws IOException {
+        long u = readVarLong(in);
+        return zigzagDecodeLongToInt(u);
+    }
+
+    private static int varLongBytesUnsigned(long v) {
+        int n = 1;
+        while ((v & ~0x7FL) != 0L) {
+            n++;
+            v >>>= 7;
+        }
+        return n;
+    }
+
+    // 估算非负 int 的 VariableByteEncoder 字节数（等价于无符号 VarInt）
+    private static int varIntBytesUnsigned(int v) {
+        // 假设 v >= 0
+        int n = 1;
+        while ((v & ~0x7F) != 0) {
+            n++;
+            v >>>= 7;
+        }
+        return n;
+    }
+
+    private static int zigzagIntBytes(int x) {
+        return varLongBytesUnsigned(zigzagEncodeIntToLong(x));
+    }
+
+
+
+
+   
+    private static ArrayList<M_HARP.ResidualBlock> readResidualBlocks(ByteArrayInputStream in) throws IOException {
+        int cnt = VariableByteEncoder.read(in);
+        ArrayList<M_HARP.ResidualBlock> blocks = new ArrayList<>(Math.max(0, cnt));
+
+        long ts = 0;
+        for (int i = 0; i < cnt; i++) {
+            long dts = readVarLong(in);
+            ts += dts;
+
+            int q0 = readZigZagInt(in);
+            int q1 = readZigZagInt(in);
+
+            int n = VariableByteEncoder.read(in);
+            ArrayList<Integer> res = new ArrayList<>(Math.max(0, n));
+            for (int k = 0; k < n; k++) {
+                res.add(readZigZagInt(in));
+            }
+
+            blocks.add(new M_HARP.ResidualBlock(ts, q0, q1, res));
+        }
+
+        return blocks;
+    }
+
+
+    private static int estimatePlaSegmentBytes(long tsDeltaApprox, int bQ, M_HARP.AEnc aEnc) {
+        // ts delta 用 VarLong；bQ 用 VarInt（这里用 bOff = bQ-globalMinB）
+        int bytes = 0;
+        bytes += varLongBytesUnsigned(Math.max(0L, tsDeltaApprox));
+        int bOff = bQ - globalMinB;
+        if (bOff < 0) bOff = 0; // 防御
+        bytes += varIntBytesUnsigned(bOff);
+
+        // AEnc: 1 tag + (2 bytes half / 4 bytes float / 8 bytes double)
+        bytes += 1;
+        if (aEnc.tag == 0) bytes += 2;
+        else if (aEnc.tag == 1) bytes += 4;
+        else bytes += 8;
+        return bytes;
+    }
+
+
+    private static int estimateResidualBlockBytes(long tsDeltaApprox, int q0, int q1, List<Integer> residuals) {
+        int bytes = 0;
+        bytes += varLongBytesUnsigned(Math.max(0L, tsDeltaApprox));
+        bytes += zigzagIntBytes(q0);
+        bytes += zigzagIntBytes(q1);
+
+        int n = (residuals == null) ? 0 : residuals.size();
+        bytes += varIntBytesUnsigned(n);
+
+        if (residuals != null) {
+            for (int r : residuals) bytes += zigzagIntBytes(r);
+        }
+        return bytes;
+    }
+
+    private static M_HARP.ResidualBlock buildResidualBlock(List<Point> points, int startIdx, int blockLen) {
+        long ts0 = points.get(startIdx).getTimestamp();
+
+        int q0 = getQResidual(points.get(startIdx).getValue());
+        int q1 = getQResidual(points.get(startIdx + 1).getValue());
+
+        ArrayList<Integer> resList = new ArrayList<>(Math.max(0, blockLen - 2));
+
+        int pPrev2 = q0;
+        int pPrev1 = q1;
+
+        for (int j = 2; j < blockLen; j++) {
+            int qCur = getQResidual(points.get(startIdx + j).getValue());
+            int qHat = 2 * pPrev1 - pPrev2;
+            resList.add(qCur - qHat);
+            pPrev2 = pPrev1;
+            pPrev1 = qCur;
+        }
+
+        return new M_HARP.ResidualBlock(ts0, q0, q1, resList);
+    }
+
+    private static M_HARP.ResidualChoice chooseBestResidual(List<Point> points, int startIdx, int maxLen) {
+        // 需要至少 3 点（q0,q1 + 1 residual）
+        if (maxLen < 3) return null;
+
+        // 真实 dt（不是 1L）：如果段首两点时间戳相同，给个保守的 1
+        long dtApprox;
+        if (startIdx + 1 < points.size()) {
+            long d = points.get(startIdx + 1).getTimestamp() - points.get(startIdx).getTimestamp();
+            dtApprox = (d <= 0) ? 1L : Math.min(d, 1L); // 单变量编码中 tsDelta 几乎总为 1
+        } else {
+            dtApprox = 1L;
+        }
+
+        M_HARP.ResidualChoice best = null;
+        int[] candidates = (ACTIVE_CFG.residualCandidates != null && ACTIVE_CFG.residualCandidates.length > 0)
+                ? ACTIVE_CFG.residualCandidates
+                : new int[]{8, 16, 32, 64};
+        for (int len : candidates) {
+            if (len > maxLen) continue;
+
+            M_HARP.ResidualBlock rb = buildResidualBlock(points, startIdx, len);
+
+            int bytes = estimateResidualBlockBytes(dtApprox, rb.q0, rb.q1, rb.residuals);
+            double bpp = (double) bytes / (double) len;
+
+            if (best == null || bpp < best.bytesPerPoint) {
+                best = new M_HARP.ResidualChoice(len, rb, bytes, bpp);
+            }
+        }
+        return best;
+    }
+
+
+    private static class ResidualChoice {
+        final int len;
+        final M_HARP.ResidualBlock block;
+        final int bytes;
+        final double bytesPerPoint;
+
+        ResidualChoice(int len, M_HARP.ResidualBlock block, int bytes, double bytesPerPoint) {
+            this.len = len;
+            this.block = block;
+            this.bytes = bytes;
+            this.bytesPerPoint = bytesPerPoint;
+        }
+    }
+
+    // 在量化网格中计算
+    private static int getQ(double value) {
+        return (int) Math.round(value / epsilon);
+    }
+
+    // ===================== NEW: residual quant step uses 2*epsilon =====================
+    private static int getQResidual(double value) {
+        // 量化步长 = 2*epsilon -> 量化误差 <= epsilon
+        return (int) Math.round(value / (2.0 * epsilon));
+    }
+
+
+    // 残差块定义
+    private static class ResidualBlock {
+        final long startTimestamp;
+        final int q0, q1;
+        final List<Integer> residuals;
+
+        ResidualBlock(long startTimestamp, int q0, int q1, List<Integer> residuals) {
+            this.startTimestamp = startTimestamp;
+            this.q0 = q0;
+            this.q1 = q1;
+            this.residuals = residuals;
+        }
+    }
+
+
+    // 全局存储残差块
+    private static ArrayList<M_HARP.ResidualBlock> residualBlocks = new ArrayList<>();
+
+
+
+
+    // --- Half float utils (IEEE 754) ---
+    private static short floatToHalf(float f) {
+        int i = Float.floatToIntBits(f);
+        int s = (i >>> 16) & 0x8000;           // sign
+        int e = ((i >>> 23) & 0xFF) - 127 + 15; // exponent
+        int m = i & 0x7FFFFF;                  // mantissa
+
+        if (e <= 0) {
+            if (e < -10) return (short) s;     // too small -> 0
+            m = (m | 0x800000) >> (1 - e);
+            // round
+            if ((m & 0x1000) != 0) m += 0x2000;
+            return (short) (s | (m >> 13));
+        } else if (e >= 31) {
+            // Inf/NaN
+            if (m == 0) return (short) (s | 0x7C00);
+            return (short) (s | 0x7C00 | (m >> 13));
+        } else {
+            // round
+            if ((m & 0x1000) != 0) {
+                m += 0x2000;
+                if ((m & 0x800000) != 0) { // mantissa overflow
+                    m = 0;
+                    e += 1;
+                    if (e >= 31) return (short) (s | 0x7C00);
+                }
+            }
+            return (short) (s | (e << 10) | (m >> 13));
+        }
+    }
+
+    private static float halfToFloat(short h) {
+        int s = (h >>> 15) & 0x1;
+        int e = (h >>> 10) & 0x1F;
+        int m = h & 0x3FF;
+
+        int outE, outM;
+        if (e == 0) {
+            if (m == 0) {
+                outE = 0;
+                outM = 0;
+            } else {
+                // subnormal
+                e = 1;
+                while ((m & 0x400) == 0) {
+                    m <<= 1;
+                    e--;
+                }
+                m &= 0x3FF;
+                outE = e - 15 + 127;
+                outM = m << 13;
+            }
+        } else if (e == 31) {
+            outE = 255;
+            outM = m << 13;
+        } else {
+            outE = e - 15 + 127;
+            outM = m << 13;
+        }
+
+        int out = (s << 31) | (outE << 23) | outM;
+        return Float.intBitsToFloat(out);
+    }
+    private static class AEnc {
+        // tag: 0=FP16 (half), 1=FP32 (float), 2=FP64 (double)
+        final byte tag;
+        final float a;        // valid when tag==0 or tag==1
+        final double aDouble; // valid when tag==2
+        final short halfBits; // valid when tag==0
+
+        AEnc(byte tag, float a, double aDouble, short halfBits) {
+            this.tag = tag;
+            this.a = a;
+            this.aDouble = aDouble;
+            this.halfBits = halfBits;
+        }
+
+        static AEnc half(short h) {
+            return new AEnc((byte) 0, halfToFloat(h), 0.0, h);
+        }
+        static AEnc fp32(float a) {
+            return new AEnc((byte) 1, a, 0.0, (short) 0);
+        }
+        static AEnc fp64(double a) {
+            return new AEnc((byte) 2, (float) a, a, (short) 0);
+        }
+        boolean isHalf() { return tag == 0; }
+    }
+
+    /** Build a 64-bit hash key from AEnc that distinguishes FP16 / FP32 / FP64 unambiguously. */
+    private static long makeAKey(AEnc aEnc) {
+        if (aEnc.tag == 0) {
+            return (0L << 32) | (aEnc.halfBits & 0xFFFFL);
+        } else if (aEnc.tag == 1) {
+            return (1L << 32) | (Float.floatToIntBits(aEnc.a) & 0xFFFFFFFFL);
+        } else {
+            return (2L << 32) | (Double.doubleToRawLongBits(aEnc.aDouble) & 0xFFFFFFFFL);
+        }
+    }
+
+    private static void writeDoubleRaw(java.io.OutputStream out, double v) throws IOException {
+        long bits = Double.doubleToRawLongBits(v);
+        for (int i = 7; i >= 0; i--) out.write((int) ((bits >>> (i * 8)) & 0xFF));
+    }
+
+    private static double readDoubleRaw(java.io.InputStream in) throws IOException {
+        long bits = 0L;
+        for (int i = 7; i >= 0; i--) {
+            int b = in.read();
+            if (b < 0) throw new java.io.EOFException("Unexpected EOF reading double");
+            bits |= ((long) (b & 0xFF)) << (i * 8);
+        }
+        return Double.longBitsToDouble(bits);
+    }
+
+    /**
+     * Serialize the chosen A. For FP64 we emit 9 bytes (tag + 8-byte double).
+     */
+  
+    private static float halfAdjustToAtMost(float target) {
+        short h = floatToHalf(target);
+        float v = halfToFloat(h);
+        int steps = 0;
+
+        // 如果 v > target，就往下调；否则返回
+        while (v > target && steps++ < 64) {
+            h = (short) (h - 1);
+            v = halfToFloat(h);
+        }
+        return v;
+    }
+
+    /**
+     * Pick a slope value guaranteed to lie inside [aMin, aMax].
+     *
+     * Fallback chain (R1-5):
+     *   1) Try FP16 (half). If halfToFloat falls inside [lo, hi], use it.
+     *   2) Step the half grid by ±1 until it lands in [lo, hi]. If found, use it.
+     *   3) Otherwise FP32: try (float) mid. If inside interval, use it.
+     *   4) Otherwise FP32 clamped: max(lo, min(hi, mid)). Only emit if verified to remain
+     *      inside the *double-precision* original interval.
+     *   5) Otherwise FP64 with the original seg.getA() (always inside by construction).
+     */
+    private static M_HARP.AEnc chooseSafeA(FastSegment seg) {
+        double loD = seg.getAMin();
+        double hiD = seg.getAMax();
+
+        // 1. 绝对零斜率优先级：如果 0 在 AMin 和 AMax 之间，强制设为 0
+        if (loD <= 0 && hiD >= 0) {
+            return AEnc.half((short) 0);
+        }
+
+        double midD = 0.5 * (loD + hiD);
+
+        // 2. 极小斜率归零优化：针对 MoteStrain 这种微小漂移数据
+        if (epsilon > 0.01 && Math.abs(midD) < 1e-7) {
+            return AEnc.half((short) 0);
+        }
+
+        if (!Double.isFinite(loD) || !Double.isFinite(hiD) || loD > hiD) {
+            return AEnc.fp64(seg.getA());
+        }
+
+        float lo = (float) loD;
+        float hi = (float) hiD;
+        float mid = (float) midD;
+        short h = floatToHalf(mid);
+        float aHalf = halfToFloat(h);
+
+        // Step 1+2: try FP16
+        if (aHalf < lo) {
+            float adj = halfAdjustToAtLeast(lo);
+            short hh = floatToHalf(adj);
+            float vv = halfToFloat(hh);
+            if (vv >= lo && vv <= hi) return AEnc.half(hh);
+        } else if (aHalf > hi) {
+            float adj = halfAdjustToAtMost(hi);
+            short hh = floatToHalf(adj);
+            float vv = halfToFloat(hh);
+            if (vv >= lo && vv <= hi) return AEnc.half(hh);
+        } else {
+            return AEnc.half(h);
+        }
+
+        // Step 3: try FP32 mid
+        if (mid >= lo && mid <= hi) {
+            return AEnc.fp32(mid);
+        }
+
+        // Step 4: FP32 clamped — verify still inside the *double* interval.
+        float clamped = Math.max(lo, Math.min(hi, mid));
+        boolean fp32InsideDoubleInterval =
+                (double) clamped >= loD - 1e-12 && (double) clamped <= hiD + 1e-12;
+        if (fp32InsideDoubleInterval) {
+            return AEnc.fp32(clamped);
+        }
+
+        // Step 5: FP64 fallback (always inside the original interval by construction).
+        double aD;
+        if (midD >= loD && midD <= hiD) aD = midD;
+        else if (loD >= midD) aD = loD;
+        else aD = hiD;
+        return AEnc.fp64(aD);
+    }
+
+
+
+    private static void writeHalfBits(short h, ByteArrayOutputStream out) throws IOException {
+        out.write(h & 0xFF);
+        out.write((h >>> 8) & 0xFF);
+    }
+
+    private static short readHalfBits(ByteArrayInputStream in) throws IOException {
+        int lo = in.read();
+        int hi = in.read();
+        if (lo < 0 || hi < 0) throw new IOException("EOF while reading half bits");
+        return (short) ((hi << 8) | lo);
+    }
+
+
+
+
+    private static M_HARP.SegmentFit fitSegmentWithFixedB(int startIdx, List<Point> points, double b, int limitEndExclusive) {
+        long initTimestamp = points.get(startIdx).getTimestamp();
+
+        if (startIdx + 1 >= limitEndExclusive) {
+            return new M_HARP.SegmentFit(startIdx + 1, -Double.MAX_VALUE, Double.MAX_VALUE);
+        }
+
+        double dt1 = points.get(startIdx + 1).getTimestamp() - initTimestamp;
+        if (dt1 == 0) {
+            // 极端防御：重复 timestamp，直接断段
+            return new M_HARP.SegmentFit(startIdx + 1, -Double.MAX_VALUE, Double.MAX_VALUE);
+        }
+
+        double aMax = ((points.get(startIdx + 1).getValue() + epsilon) - b) / dt1;
+        double aMin = ((points.get(startIdx + 1).getValue() - epsilon) - b) / dt1;
+
+        if (startIdx + 2 >= limitEndExclusive) {
+            return new M_HARP.SegmentFit(startIdx + 2, aMin, aMax);
+        }
+
+        for (int idx = startIdx + 2; idx < limitEndExclusive; idx++) {
+            long dt = points.get(idx).getTimestamp() - initTimestamp;
+            if (dt == 0) {
+                return new M_HARP.SegmentFit(idx, aMin, aMax);
+            }
+
+            double upValue = points.get(idx).getValue() + epsilon;
+            double downValue = points.get(idx).getValue() - epsilon;
+
+            double upLim = aMax * dt + b;
+            double downLim = aMin * dt + b;
+
+            if (downValue > upLim || upValue < downLim) {
+                return new M_HARP.SegmentFit(idx, aMin, aMax);
+            }
+
+            if (upValue < upLim) {
+                aMax = Math.max((upValue - b) / dt, aMin);
+            }
+            if (downValue > downLim) {
+                aMin = Math.min((downValue - b) / dt, aMax);
+            }
+        }
+
+        return new M_HARP.SegmentFit(limitEndExclusive, aMin, aMax);
+    }
+
+    private static M_HARP.BestSegment pickBestSegmentAt(int startIdx, List<Point> points, int limitEndExclusive) {
+        double y0 = points.get(startIdx).getValue();
+        int q0 = (int) Math.round(y0 / epsilon);
+
+        M_HARP.BestSegment best = null;
+
+        for (int off : BQ_OFFSETS) {
+            int bQ = q0 + off;
+            double b = bQ * epsilon;
+
+            // ✅ 必须满足：段起点也在误差界内（因为 yhat(t0)=b）
+            if (Math.abs(y0 - b) > epsilon) continue;
+
+            M_HARP.SegmentFit fit = fitSegmentWithFixedB(startIdx, points, b, limitEndExclusive);
+
+            if (best == null || fit.endIdx > best.fit.endIdx) {
+                best = new M_HARP.BestSegment(fit, bQ, b);
+            } else if (fit.endIdx == best.fit.endIdx) {
+                int bestOffAbs = Math.abs(best.bQ - q0);
+                int curOffAbs = Math.abs(bQ - q0);
+                if (curOffAbs < bestOffAbs) {
+                    best = new M_HARP.BestSegment(fit, bQ, b);
+                }
+            }
+        }
+
+        // 兜底：如果全被过滤掉（极少见，浮点误差/极小epsilon时），退回原始 ceil/floor
+        if (best == null) {
+            int qFloor = (int) Math.floor(y0 / epsilon);
+            int qCeil  = (int) Math.ceil(y0 / epsilon);
+
+            int[] fallback = (qFloor == qCeil) ? new int[]{qFloor} : new int[]{qFloor, qCeil};
+            for (int bQ : fallback) {
+                double b = bQ * epsilon;
+                M_HARP.SegmentFit fit = fitSegmentWithFixedB(startIdx, points, b, limitEndExclusive);
+                if (best == null || fit.endIdx > best.fit.endIdx) best = new M_HARP.BestSegment(fit, bQ, b);
+            }
+        }
+
+        return best;
+    }
+
+
+    private static M_HARP.SegmentResult compressRange(List<Point> points, int startIdx, int ownerEndExclusive, int lookaheadEndExclusive) {
+        ArrayList<FastSegment> segments = new ArrayList<>();
+        ArrayList<M_HARP.ResidualBlock> localResiduals = new ArrayList<>();
+        int localMinBQ = Integer.MAX_VALUE;
+
+        int currentIdx = startIdx;
+        while (currentIdx < ownerEndExclusive) {
+            M_HARP.BestSegment best = pickBestSegmentAt(currentIdx, points, lookaheadEndExclusive);
+            M_HARP.BestSegment safe = makeSafe(best, currentIdx, points);
+            int plaLen = safe.fit.endIdx - currentIdx;
+
+            long initTs = points.get(currentIdx).getTimestamp();
+            FastSegment tmpSeg = new FastSegment(initTs, safe.fit.aMin, safe.fit.aMax, safe.b);
+            M_HARP.AEnc aEnc = chooseSafeA(tmpSeg);
+
+            int plaBytes = estimatePlaSegmentBytes(1L, safe.bQ, aEnc);
+            double plaBpp = (plaLen <= 0) ? Double.POSITIVE_INFINITY : ((double) plaBytes / (double) plaLen);
+
+            boolean useResidual = false;
+            int remain = ownerEndExclusive - currentIdx;
+            int maxLen = Math.min(remain, 64);
+
+            if (ACTIVE_CFG.enableResidual && currentIdx + 2 < ownerEndExclusive && maxLen >= 3) {
+                M_HARP.ResidualChoice rc = chooseBestResidual(points, currentIdx, maxLen);
+                if (rc != null) {
+       
+                    double threshold = ACTIVE_CFG.residualThreshold;
+                    if (epsilon > ACTIVE_CFG.residualEpsilonSwitch) {
+                        threshold = ACTIVE_CFG.residualThresholdLargeEps;
+                    } 
+                    if (plaLen > ACTIVE_CFG.plaLenShortCircuit) {
+                        threshold -= ACTIVE_CFG.plaLenShortCircuitThresholdDrop;
+                    }   
+
+                    if (rc.bytesPerPoint < plaBpp * threshold) {
+                        useResidual = true;
+                        localResiduals.add(rc.block);
+                        currentIdx += rc.len;
+                        continue;
+                    }
+                }
+            }
+
+            segments.add(new FastSegment(initTs, safe.fit.aMin, safe.fit.aMax, safe.b));
+            localMinBQ = Math.min(localMinBQ, safe.bQ);
+            currentIdx = safe.fit.endIdx;
+        }
+        return new M_HARP.SegmentResult(segments, localMinBQ, localResiduals);
+    }
+
+    private static ArrayList<FastSegment> deepPostMerge(List<Point> points, ArrayList<FastSegment> segments) {
+        if (segments.size() < 2) return segments;
+        ArrayList<FastSegment> merged = new ArrayList<>();
+
+        FastSegment current = segments.get(0);
+        for (int i = 1; i < segments.size(); i++) {
+            FastSegment next = segments.get(i);
+
+            int startIdx = indexOfTimestampExact(points, current.getInitTimestamp());
+        
+            int endIdxNextLimit = (i + 1 < segments.size())
+                    ? indexOfTimestampExact(points, segments.get(i+1).getInitTimestamp())
+                    : points.size();
+
+            // 保持 current 的截距 b 不变，尝试向后延伸斜率 a
+            double b = current.getB();
+            M_HARP.SegmentFit trialFit = fitSegmentWithFixedB(startIdx, points, b, endIdxNextLimit);
+
+
+            if (trialFit.endIdx >= endIdxNextLimit) {
+                
+                current = new FastSegment(current.getInitTimestamp(), trialFit.aMin, trialFit.aMax, b);
+            } else {
+           
+                merged.add(current);
+                current = next;
+            }
+        }
+        merged.add(current);
+        return merged;
+    }
+
+
+
+    private static final int[] BQ_OFFSETS = new int[]{-1, 0, 1};
+
+
+    private static M_HARP.BestSegment makeSafe(M_HARP.BestSegment seg, int startIdx, List<Point> points) {
+        int end = seg.fit.endIdx;
+        double b = seg.b;
+
+        // 从 seg 给的 endIdx 开始，如果不安全就逐步缩短
+        while (end > startIdx + 1) {
+            M_HARP.SegmentFit refit = fitSegmentWithFixedB(startIdx, points, b, end);
+            if (segmentSatisfies(points, startIdx, refit.endIdx, refit.aMin, refit.aMax, b)) {
+                int bQ = (int) Math.round(b / epsilon);
+                return new M_HARP.BestSegment(refit, bQ, b);
+            }
+            end--; // 缩短 1 个点再试
+        }
+
+        // 最差退化：至少覆盖 2 个点
+        M_HARP.SegmentFit refit = fitSegmentWithFixedB(startIdx, points, b, Math.min(points.size(), startIdx + 2));
+        int bQ = (int) Math.round(b / epsilon);
+        return new M_HARP.BestSegment(refit, bQ, b);
+    }
+
+    private static boolean segmentSatisfies(List<Point> points, int startIdx, int endExclusive,
+                                            double aMin, double aMax, double b) {
+        long t0 = points.get(startIdx).getTimestamp();
+
+        // 选一个确定的 a（区间中点）。这里用 double 校验，避免 float 误差
+        double a = 0.5 * (aMin + aMax);
+
+        for (int i = startIdx; i < endExclusive; i++) {
+            long dt = points.get(i).getTimestamp() - t0;
+            double yHat = a * dt + b;
+            double y = points.get(i).getValue();
+            if (Math.abs(y - yHat) > epsilon + 1e-12) return false;
+        }
+        return true;
+    }
+
+
+
+    private static class SegmentFit {
+        final int endIdx;      // 覆盖到 endIdx-1
+        final double aMin;
+        final double aMax;
+
+        SegmentFit(int endIdx, double aMin, double aMax) {
+            this.endIdx = endIdx;
+            this.aMin = aMin;
+            this.aMax = aMax;
+        }
+    }
+
+    private static class BestSegment {
+        final M_HARP.SegmentFit fit;
+        final int bQ;          // b 的量化整数：b = bQ * epsilon
+        final double b;
+
+        BestSegment(M_HARP.SegmentFit fit, int bQ, double b) {
+            this.fit = fit;
+            this.bQ = bQ;
+            this.b = b;
+        }
+    }
+
+    private static class SegmentResult {
+        final ArrayList<FastSegment> segments;
+        final int minBQ;
+        final ArrayList<M_HARP.ResidualBlock> residuals; // 新增这一行
+
+        // 构造函数也需要增加一个参数
+        SegmentResult(ArrayList<FastSegment> segments, int minBQ, ArrayList<M_HARP.ResidualBlock> residuals) {
+            this.segments = segments;
+            this.minBQ = minBQ;
+            this.residuals = residuals; // 赋值
+        }
+    }
+
+    /**
+     * Configuration for M_HARP compression. Lets reviewers / benchmarks compare
+     * with- vs without-Zstd, single-threaded vs multi-threaded, etc., without
+     * recompiling.
+     */
+    public static class Config {
+        // R1-3: enable the final Zstd post-pass
+        public boolean enableZstd = true;
+        // R1-2: explicit thread count. -1 = auto (use shared pool), 1 = strict sequential, N>1 = fresh bounded executor
+        public int requestedThreads = -1;
+        // R1-5: FP64 fallback chain when FP32 cannot represent a feasible slope
+        public boolean enableFp64Fallback = true;
+        // R1-4 / R2-3: residual candidates + thresholds for sensitivity sweep
+        public int[] residualCandidates = new int[]{8, 16, 32, 64};
+        public double residualThreshold = 0.90;
+        public double residualThresholdLargeEps = 0.70;
+        public double residualEpsilonSwitch = 0.02;
+        public int plaLenShortCircuit = 30;
+        public double plaLenShortCircuitThresholdDrop = 0.15;
+        // ablation flags (M_HARP_XR forwards these from TestAblationM_HARP)
+        public boolean enableStitch = true;
+        public boolean enableGroupedMerge = true;
+        public boolean enableResidual = true;
+        public boolean enableHalfA = true;
+        public boolean enableTsBaseDelta = true;
+        public int forceMode = -1;
+
+        public static Config defaults() {
+            return new Config();
+        }
+    }
+
+    /**
+     * Result wrapper exposing both raw (uncompressed) and Zstd-compressed byte streams.
+     */
+    public static class CompressResult {
+        public final byte[] rawBytes;
+        public final byte[] zstdBytes;
+        public final double zstdMs;
+
+        public CompressResult(byte[] rawBytes, byte[] zstdBytes, double zstdMs) {
+            this.rawBytes = rawBytes;
+            this.zstdBytes = zstdBytes;
+            this.zstdMs = zstdMs;
+        }
+
+        public int finalBytes() {
+            return (zstdBytes != null) ? zstdBytes.length : rawBytes.length;
+        }
+
+        public byte[] finalBytesForm() {
+            return (zstdBytes != null) ? zstdBytes : rawBytes;
+        }
+    }
+
+    /**
+     * Decompress a binary representation and return a list of Points
+     * @param binary Binary representation (Zstd-wrapped)
+     * @return Time-series data
+     */
+    public static List<Point> decompress(byte[] binary) {
+        readByteArray(binary);
+        return toPoints();
+    }
+
+    /**
+     * Decompress a raw (uncompressed) byte stream produced by {@link #compressWithResult}
+     * when Config.enableZstd=false. Skips the Zstd step.
+     */
+    public static List<Point> decompressRaw(byte[] rawBody) {
+        readByteArray(rawBody);
+        return toPoints();
+    }
+
+
+    private static void mergeAll(ArrayList<FastSegment> segments, ArrayList<FastSegment> mergedSegments, ArrayList<FastSegment> unmergedSegments) {
+        double aMinTemp = -Double.MAX_VALUE;
+        double aMaxTemp = Double.MAX_VALUE;
+        ArrayList<Double> bValues = new ArrayList<>();
+        ArrayList<Long> timestamps = new ArrayList<>();
+
+        segments.sort(Comparator.comparingDouble(FastSegment::getAMin));
+        for (int i = 0; i < segments.size(); i++) {
+            if (segments.get(i).getAMin() <= aMaxTemp && segments.get(i).getAMax() >= aMinTemp) {
+                timestamps.add(segments.get(i).getInitTimestamp());
+                aMinTemp = Math.max(aMinTemp, segments.get(i).getAMin());
+                aMaxTemp = Math.min(aMaxTemp, segments.get(i).getAMax());
+                bValues.add(segments.get(i).getB());
+            } else {
+                if (timestamps.size() == 1) unmergedSegments.add(segments.get(i - 1));
+                else {
+                    for (int j = 0; j < timestamps.size(); j++)
+                        mergedSegments.add(new FastSegment(timestamps.get(j), aMinTemp, aMaxTemp, bValues.get(j)));
+                }
+                timestamps.clear();
+                timestamps.add(segments.get(i).getInitTimestamp());
+                aMinTemp = segments.get(i).getAMin();
+                aMaxTemp = segments.get(i).getAMax();
+                bValues.clear();
+                bValues.add(segments.get(i).getB());
+            }
+        }
+        if (!timestamps.isEmpty()) {
+            if (timestamps.size() == 1)
+                unmergedSegments.add(new FastSegment(timestamps.get(0), aMinTemp, aMaxTemp, bValues.get(0)));
+            else {
+                for (int i = 0; i < timestamps.size(); i++)
+                    mergedSegments.add(new FastSegment(timestamps.get(i), aMinTemp, aMaxTemp, bValues.get(i)));
+            }
+        }
+    }
+
+
+  
+    private static List<Point> toPoints() {
+        // 1. 收集所有 PLA 分段
+        ArrayList<FastSegment> allSegments = new ArrayList<>();
+        if (perBSegments != null) allSegments.addAll(perBSegments);
+        if (perASegments != null) allSegments.addAll(perASegments);
+        if (restSegments != null) allSegments.addAll(restSegments);
+
+        // 2. 统一封装：将 FastSegment 和 ResidualBlock 放入同一个有序结构中
+        class DataChunk {
+            final long ts;
+            final Object data; // FastSegment 或 ResidualBlock
+            final boolean isResidual;
+
+            DataChunk(long ts, Object data, boolean isResidual) {
+                this.ts = ts;
+                this.data = data;
+                this.isResidual = isResidual;
+            }
+        }
+
+        List<DataChunk> chunks = new ArrayList<>();
+        for (FastSegment s : allSegments) {
+            chunks.add(new DataChunk(s.getInitTimestamp(), s, false));
+        }
+        if (residualBlocks != null) {
+            for (M_HARP.ResidualBlock rb : residualBlocks) {
+                chunks.add(new DataChunk(rb.startTimestamp, rb, true));
+            }
+        }
+
+        // 按时间戳从早到晚排序
+        chunks.sort(Comparator.comparingLong(c -> c.ts));
+
+        List<Point> points = new ArrayList<>();
+        if (chunks.isEmpty()) return points;
+
+        // 3. 顺序还原
+        for (int i = 0; i < chunks.size(); i++) {
+            DataChunk current = chunks.get(i);
+
+            // 如果是最后一个片段，则运行到 lastTimeStamp；否则运行到下一个片段开始前
+            long nextChunkTs = (i + 1 < chunks.size()) ? chunks.get(i + 1).ts : lastTimeStamp + 1;
+
+            if (!current.isResidual) {
+                // --- 处理 PLA 分段 ---
+                FastSegment s = (FastSegment) current.data;
+                long t0 = s.getInitTimestamp();
+                double a = s.getA();
+                double b = s.getB();
+
+                for (long t = t0; t < nextChunkTs; t++) {
+                    points.add(new Point(t, a * (t - t0) + b));
+                }
+            } else {
+                // --- 处理残差块 (Residual Block) ---
+                M_HARP.ResidualBlock rb = (M_HARP.ResidualBlock) current.data;
+                long t = rb.startTimestamp;
+
+                // ✅ 关键改动：residual 的反量化步长必须与 getQResidual 对齐
+                // getQResidual(value) = round(value / (2*epsilon))
+                // 所以解码要乘回 resStep = 2*epsilon
+                double resStep = 2.0 * epsilon;
+
+                // 还原前两个基础点
+                int pPrev2 = rb.q0;
+                int pPrev1 = rb.q1;
+                points.add(new Point(t++, pPrev2 * resStep));
+
+                if (t < nextChunkTs) {
+                    points.add(new Point(t++, pPrev1 * resStep));
+                }
+
+                // 还原后续预测残差生成的点
+                for (int res : rb.residuals) {
+                    if (t >= nextChunkTs) break;
+
+                    // 二阶线性预测还原：q_i = 2*q_{i-1} - q_{i-2} + residual
+                    int qCur = 2 * pPrev1 - pPrev2 + res;
+                    points.add(new Point(t++, qCur * resStep));
+
+                    pPrev2 = pPrev1;
+                    pPrev1 = qCur;
+                }
+            }
+        }
+
+        return points;
+    }
+
+
+
+    // ===================== NEW: sequential segments writer/reader =====================
+    private static void writeSegmentsSequential(ArrayList<FastSegment> segments, ByteArrayOutputStream out) throws IOException {
+        if (segments == null || segments.isEmpty()) {
+            VariableByteEncoder.write(0, out);
+            return;
+        }
+
+        segments.sort(Comparator.comparingLong(FastSegment::getInitTimestamp));
+
+        VariableByteEncoder.write(segments.size(), out);
+
+        long baseTs = segments.get(0).getInitTimestamp();
+        writeVarLong(baseTs, out);
+
+        long prevTs = baseTs;
+
+        for (FastSegment s : segments) {
+            long ts = s.getInitTimestamp();
+            long dts = ts - prevTs;
+            if (dts < 0) throw new IOException("Negative ts delta in sequential segments");
+            writeVarLong(dts, out);
+            prevTs = ts;
+
+            int bQ = (int) Math.round(s.getB() / epsilon);
+            int bOff = bQ - globalMinB;
+            if (bOff < 0) bOff = 0; // 防御
+            VariableByteEncoder.write(bOff, out);
+
+            M_HARP.AEnc aEnc = chooseSafeA(s);
+writeAEnc(aEnc, out);
+        }
+    }
+
+    private static ArrayList<FastSegment> readSegmentsSequential(ByteArrayInputStream in) throws IOException {
+        ArrayList<FastSegment> segments = new ArrayList<>();
+
+        int n = VariableByteEncoder.read(in);
+        if (n == 0) return segments;
+
+        long baseTs = readVarLong(in);
+        long ts = baseTs;
+
+        for (int i = 0; i < n; i++) {
+            long dts = readVarLong(in);
+            ts += dts;
+
+            int bOff = VariableByteEncoder.read(in);
+            int bQ = globalMinB + bOff;
+
+            int tag = in.read();
+            if (tag < 0) throw new IOException("EOF while reading A tag");
+
+            float a;
+            if (tag == 0) a = halfToFloat(readHalfBits(in));
+            else if (tag == 1) a = FloatEncoder.read(in);
+            else throw new IOException("Invalid A tag: " + tag);
+
+            segments.add(new FastSegment(ts, a, (float) (bQ * epsilon)));
+        }
+        return segments;
+    }
+
+
+
+
+//    private static byte[] toByteArray() {
+//        byte[] bytes = null;
+//
+//        try {
+//            // 先构建两种 body（不压缩）并选择更小的那一个
+//            byte[] groupedBody = null;
+//            byte[] sequentialBody = null;
+//
+//            // GROUPED: 你现在的 perB/perA/rest
+//            {
+//                ByteArrayOutputStream raw = new ByteArrayOutputStream();
+//                // header
+//                raw.write(MAGIC1);
+//                raw.write(MAGIC2);
+//                raw.write(FORMAT_VERSION);
+//                raw.write(MODE_GROUPED);
+//
+//                // epsilon & globalMinB
+//                FloatEncoder.write((float) epsilon, raw);
+//                VariableByteEncoder.write(globalMinB, raw);
+//
+//                // segments in grouped format
+//                toByteArrayPerBSegments(perBSegments, raw);
+//                toByteArrayPerASegments(perASegments, raw);
+//                toByteArrayRestSegments(restSegments, raw);
+//
+//                // residual + lastTimeStamp
+//                writeResidualBlocks(residualBlocks, raw);
+//                writeVarLong(lastTimeStamp, raw);
+//
+//                groupedBody = raw.toByteArray();
+//                raw.close();
+//            }
+//
+
+//            {
+//                ArrayList<FastSegment> all = new ArrayList<>();
+//                if (perBSegments != null) all.addAll(perBSegments);
+//                if (perASegments != null) all.addAll(perASegments);
+//                if (restSegments != null) all.addAll(restSegments);
+//
+//                ByteArrayOutputStream raw = new ByteArrayOutputStream();
+//                raw.write(MAGIC1);
+//                raw.write(MAGIC2);
+//                raw.write(FORMAT_VERSION);
+//                raw.write(MODE_SEQUENTIAL);
+//
+//                FloatEncoder.write((float) epsilon, raw);
+//                VariableByteEncoder.write(globalMinB, raw);
+//
+//                writeSegmentsSequential(all, raw);
+//
+//                writeResidualBlocks(residualBlocks, raw);
+//                writeVarLong(lastTimeStamp, raw);
+//
+//                sequentialBody = raw.toByteArray();
+//                raw.close();
+//            }
+//
+//            // 选择更小的 raw body 再 Zstd 压缩
+//            byte[] chosen = (sequentialBody.length < groupedBody.length) ? sequentialBody : groupedBody;
+//
+//            bytes = Zstd.compress(chosen);
+//            System.out.println("bytes：" + bytes.length);
+//
+//        } catch (Exception e) {
+//            e.printStackTrace();
+//        }
+//
+//        return bytes;
+//    }
+
+    private static CompressResult toByteArray() throws IOException {
+        return toByteArrayResult(Config.defaults());
+    }
+
+    /**
+     * Build the CompressResult, honoring the Zstd flag from Config.
+     * If enableZstd=false, returns CompressResult with zstdBytes=null and zstdMs=0.
+     */
+    private static CompressResult toByteArrayResult(Config cfg) throws IOException {
+        try {
+            byte[] groupedBody;
+            byte[] sequentialBody;
+
+            // GROUPED: perB / perA / rest
+            {
+                ByteArrayOutputStream raw = new ByteArrayOutputStream();
+
+                raw.write(MAGIC1);
+                raw.write(MAGIC2);
+                raw.write(FORMAT_VERSION);
+                raw.write(MODE_GROUPED);
+
+                FloatEncoder.write((float) epsilon, raw);
+                VariableByteEncoder.write(globalMinB, raw);
+
+                toByteArrayPerBSegments(perBSegments, raw);
+                toByteArrayPerASegments(perASegments, raw);
+                toByteArrayRestSegments(restSegments, raw);
+
+                writeResidualBlocks(residualBlocks, raw);
+                writeVarLong(lastTimeStamp, raw);
+
+                groupedBody = raw.toByteArray();
+                raw.close();
+            }
+
+            // SEQUENTIAL: 顺序段流
+            {
+                ArrayList<FastSegment> all = new ArrayList<>();
+                if (perBSegments != null) all.addAll(perBSegments);
+                if (perASegments != null) all.addAll(perASegments);
+                if (restSegments != null) all.addAll(restSegments);
+
+                ByteArrayOutputStream raw = new ByteArrayOutputStream();
+
+                raw.write(MAGIC1);
+                raw.write(MAGIC2);
+                raw.write(FORMAT_VERSION);
+                raw.write(MODE_SEQUENTIAL);
+
+                FloatEncoder.write((float) epsilon, raw);
+                VariableByteEncoder.write(globalMinB, raw);
+
+                writeSegmentsSequential(all, raw);
+
+                writeResidualBlocks(residualBlocks, raw);
+                writeVarLong(lastTimeStamp, raw);
+
+                sequentialBody = raw.toByteArray();
+                raw.close();
+            }
+
+            byte[] chosen = (sequentialBody.length < groupedBody.length)
+                    ? sequentialBody
+                    : groupedBody;
+
+            if (!cfg.enableZstd) {
+                return new CompressResult(chosen, null, 0.0);
+            }
+
+            long z0 = System.nanoTime();
+            byte[] zstdBytes = Zstd.compress(chosen);
+            long z1 = System.nanoTime();
+
+            double zstdMs = (z1 - z0) / 1_000_000.0;
+
+            return new CompressResult(chosen, zstdBytes, zstdMs);
+
+        } catch (Exception e) {
+            throw new IOException("M_HARP toByteArray failed", e);
+        }
+    }
+
+
+    private static void readByteArray(byte[] input) {
+        residualBlocks = new ArrayList<>();
+
+        try {
+            byte[] binary = zstdDecompressSafe(input);
+            ByteArrayInputStream in = new ByteArrayInputStream(binary);
+
+            // 尝试识别新格式：MAGIC 'F''P'
+            in.mark(8);
+            int m1 = in.read();
+            int m2 = in.read();
+
+            boolean isNew = (m1 == MAGIC1 && m2 == MAGIC2);
+            if (!isNew) {
+                // 旧格式：回退到你原来的读法（无 magic）
+                in.reset();
+
+                epsilon = FloatEncoder.read(in);
+                globalMinB = VariableByteEncoder.read(in);
+
+                perBSegments = readMergedPerBSegments(in);
+                perASegments = readMergedPerASegments(in);
+                restSegments = readUnmerged(in);
+
+                residualBlocks = readResidualBlocks(in);
+                lastTimeStamp = readVarLong(in);
+
+                in.close();
+                return;
+            }
+
+            int ver = in.read();
+            if (ver < 0) throw new IOException("EOF while reading version");
+            if (ver != FORMAT_VERSION) {
+                throw new IOException("Unsupported format version: " + ver);
+            }
+
+            int mode = in.read();
+            if (mode < 0) throw new IOException("EOF while reading mode");
+
+            epsilon = FloatEncoder.read(in);
+            globalMinB = VariableByteEncoder.read(in);
+
+            if (mode == MODE_GROUPED) {
+                perBSegments = readMergedPerBSegments(in);
+                perASegments = readMergedPerASegments(in);
+                restSegments = readUnmerged(in);
+            } else if (mode == MODE_SEQUENTIAL) {
+                ArrayList<FastSegment> all = readSegmentsSequential(in);
+                perBSegments = new ArrayList<>();
+                perASegments = new ArrayList<>();
+                restSegments = all;
+            } else {
+                throw new IOException("Invalid mode: " + mode);
+            }
+
+            residualBlocks = readResidualBlocks(in);
+            lastTimeStamp = readVarLong(in);
+
+            in.close();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+
+
+
+   
+
+
+    /**
+     * 并行压缩方法，统一使用线程池
+     */
+
+    // Backward-compatible entry: returns the final on-disk byte stream (Zstd-wrapped).
+    public static byte[] compress(List<Point> points, double error) throws Exception {
+        return compress(points, error, Config.defaults());
+    }
+
+    public static byte[] compress(List<Point> points, double error, Config cfg) throws Exception {
+        return compressWithResult(points, error, cfg).finalBytesForm();
+    }
+
+    public static CompressResult compressWithResult(List<Point> points, double error) throws Exception {
+        return compressWithResult(points, error, Config.defaults());
+    }
+
+    public static CompressResult compressWithResult(List<Point> points, double error, Config cfg) throws Exception {
+        if (points == null || points.isEmpty() || error <= 0)
+            throw new Exception("Invalid input or epsilon");
+
+        epsilon = error;
+        lastTimeStamp = points.get(points.size() - 1).getTimestamp();
+
+        // Reset containers before compression.
+        perBSegments = new ArrayList<>();
+        perASegments = new ArrayList<>();
+        restSegments = new ArrayList<>();
+        residualBlocks = new ArrayList<>();
+
+        return compressInternal(points, cfg);
+    }
+
+    private static CompressResult compressInternal(List<Point> points, Config cfg) throws Exception {
+        if (cfg.requestedThreads <= 1) {
+            // Strict sequential path — no executor overhead.
+            runSequential(points);
+            return toByteArrayResult(cfg);
+        }
+
+        if (cfg.requestedThreads == -1) {
+            // Auto: use the shared pool (legacy behavior).
+            ExecutorService shared = FastThreadPoolManager.getCommonExecutor();
+            int poolSize = (shared instanceof ThreadPoolExecutor)
+                    ? Math.max(1, ((ThreadPoolExecutor) shared).getCorePoolSize())
+                    : Math.max(1, Runtime.getRuntime().availableProcessors());
+            return runWithExecutor(points, poolSize, shared, cfg);
+        }
+
+        // Explicit N>1: fresh bounded executor to avoid state pollution.
+        ExecutorService fresh = FastThreadPoolManager.createBoundedExecutor(cfg.requestedThreads);
+        try {
+            return runWithExecutor(points, cfg.requestedThreads, fresh, cfg);
+        } finally {
+            fresh.shutdownNow();
+        }
+    }
+
+    private static void runSequential(List<Point> points) {
+        M_HARP.SegmentResult r = compressRange(points, 0, points.size(), points.size());
+        ArrayList<FastSegment> allSegments = new ArrayList<>(r.segments);
+        ArrayList<M_HARP.ResidualBlock> allResiduals = new ArrayList<>();
+        if (r.residuals != null) allResiduals.addAll(r.residuals);
+        residualBlocks = allResiduals;
+        if (!allSegments.isEmpty()) {
+            allSegments.sort(Comparator.comparingLong(FastSegment::getInitTimestamp));
+            // No chunk boundaries in sequential mode; pass empty list.
+            allSegments = stitchChunkBoundariesSafe(points, allSegments, new ArrayList<>(), 2048);
+            allSegments = deepPostMerge(points, allSegments);
+            allSegments.sort(Comparator.comparingLong(FastSegment::getInitTimestamp));
+            int globalMinBQ = recomputeGlobalMinBQ(allSegments);
+            globalMinB = globalMinBQ;
+            merge(allSegments);
+        }
+    }
+
+    private static CompressResult runWithExecutor(List<Point> points, int poolSize, ExecutorService segmentExecutor, Config cfg) throws Exception {
+        int n = points.size();
+        int chunk = Math.max(1, n / poolSize);
+
+        List<Future<M_HARP.SegmentResult>> futures = new ArrayList<>();
+        ArrayList<Long> boundaries = new ArrayList<>();
+
+        for (int i = 0; i < poolSize; i++) {
+            int startIdx = i * chunk;
+            int endIdx = (i == poolSize - 1) ? n : Math.min(n, (i + 1) * chunk);
+            if (startIdx >= endIdx) break;
+
+            if (i > 0) {
+                boundaries.add(points.get(startIdx).getTimestamp());
+            }
+
+            int lookaheadEnd = (endIdx < n) ? Math.min(n, endIdx + 1) : endIdx;
+
+            final int s = startIdx;
+            final int ownerEnd = endIdx;
+            final int lookEnd = lookaheadEnd;
+
+            futures.add(segmentExecutor.submit(() -> compressRange(points, s, ownerEnd, lookEnd)));
+        }
+
+        ArrayList<FastSegment> allSegments = new ArrayList<>();
+        ArrayList<M_HARP.ResidualBlock> allResiduals = new ArrayList<>();
+        int globalMinBQ = Integer.MAX_VALUE;
+
+        for (Future<M_HARP.SegmentResult> f : futures) {
+            M_HARP.SegmentResult r = f.get();
+            allSegments.addAll(r.segments);
+            if (r.residuals != null) allResiduals.addAll(r.residuals);
+            globalMinBQ = Math.min(globalMinBQ, r.minBQ);
+        }
+
+        residualBlocks = allResiduals;
+
+        if (!allSegments.isEmpty()) {
+            allSegments.sort(Comparator.comparingLong(FastSegment::getInitTimestamp));
+
+            allSegments = stitchChunkBoundariesSafe(points, allSegments, boundaries, 2048);
+
+            allSegments = deepPostMerge(points, allSegments);
+
+            allSegments.sort(Comparator.comparingLong(FastSegment::getInitTimestamp));
+            globalMinBQ = recomputeGlobalMinBQ(allSegments);
+            globalMinB = globalMinBQ;
+
+            merge(allSegments);
+        }
+
+        return toByteArrayResult(cfg);
+    }
+
+
+//    public static byte[] compress(List<Point> points, double error) throws Exception {
+//        if (points == null || points.isEmpty() || error <= 0)
+//            throw new Exception("Invalid input or epsilon");
+//
+//        epsilon = error;
+//        lastTimeStamp = points.get(points.size() - 1).getTimestamp();
+//
+//        ExecutorService segmentExecutor = FastThreadPoolManager.getCommonExecutor();
+//        int poolSize = ((ThreadPoolExecutor) segmentExecutor).getCorePoolSize();
+//        poolSize = Math.max(1, poolSize);
+//
+//        int n = points.size();
+//        int chunk = Math.max(1, n / poolSize);
+//
+//        // 注意：SegmentResult 现在包含 segments 和 residuals
+//        List<Future<M_HARP.SegmentResult>> futures = new ArrayList<>();
+//        ArrayList<Long> boundaries = new ArrayList<>();
+//
+//        for (int i = 0; i < poolSize; i++) {
+//            int startIdx = i * chunk;
+//            int endIdx = (i == poolSize - 1) ? n : Math.min(n, (i + 1) * chunk);
+//            if (startIdx >= endIdx) break;
+//
+//            if (i > 0) {
+//                boundaries.add(points.get(startIdx).getTimestamp());
+//            }
+//
+//            int lookaheadEnd = (endIdx < n) ? Math.min(n, endIdx + 1) : endIdx;
+//
+//            final int s = startIdx;
+//            final int ownerEnd = endIdx;
+//            final int lookEnd = lookaheadEnd;
+//
+//            futures.add(segmentExecutor.submit(() -> compressRange(points, s, ownerEnd, lookEnd)));
+//        }
+//
+//        ArrayList<FastSegment> allSegments = new ArrayList<>();
+//        ArrayList<M_HARP.ResidualBlock> allResiduals = new ArrayList<>(); // 新增：用于收集残差块
+//        int globalMinBQ = Integer.MAX_VALUE;
+//
+//        // 汇总结果
+//        for (Future<M_HARP.SegmentResult> f : futures) {
+//            M_HARP.SegmentResult r = f.get();
+//            allSegments.addAll(r.segments);
+//            if (r.residuals != null) allResiduals.addAll(r.residuals);
+//            globalMinBQ = Math.min(globalMinBQ, r.minBQ);
+//        }
+//        residualBlocks = allResiduals;
+//
+//        if (!allSegments.isEmpty()) {
+//            allSegments.sort(Comparator.comparingLong(FastSegment::getInitTimestamp));
+//
+//            // 步骤 A: 边界安全缝合（快速合并）
+//            allSegments = stitchChunkBoundariesSafe(points, allSegments, boundaries, 2048);
+//
+//            // 步骤 B: --- 核心新增：深度后合并 ---
+//            // 这是反超 Mix-Piece 的关键，它提供了全局扫描能力
+//            allSegments = deepPostMerge(points, allSegments);
+//
+//            allSegments.sort(Comparator.comparingLong(FastSegment::getInitTimestamp));
+//            globalMinBQ = recomputeGlobalMinBQ(allSegments);
+//            globalMinB = globalMinBQ;
+//
+//            // 步骤 C: 分组元数据压缩
+//            merge(allSegments);
+//        }
+//
+//        return toByteArray();
+//    }
+
+    private static int indexOfTimestampExact(List<Point> points, long ts) {
+        int lo = 0, hi = points.size() - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            long t = points.get(mid).getTimestamp();
+            if (t == ts) return mid;
+            if (t < ts) lo = mid + 1;
+            else hi = mid - 1;
+        }
+        return -1;
+    }
+
+
+    private static int indexOfTimestamp(List<Point> points, long ts) {
+        int lo = 0, hi = points.size() - 1;
+        while (lo <= hi) {
+            int mid = (lo + hi) >>> 1;
+            long t = points.get(mid).getTimestamp();
+            if (t == ts) return mid;
+            if (t < ts) lo = mid + 1;
+            else hi = mid - 1;
+        }
+        // 找不到精确 ts：返回最接近且 <= ts 的位置（用于 endTs 不一定存在的情况）
+        return Math.max(0, Math.min(points.size() - 1, hi));
+    }
+
+
+
+    private static void toByteArrayPerBSegments(ArrayList<FastSegment> segments, ByteArrayOutputStream outStream) throws IOException {
+        // bQ -> (aKey -> timestamps)
+        TreeMap<Integer, HashMap<Long, ArrayList<Long>>> input = new TreeMap<>();
+        HashMap<Long, M_HARP.AEnc> aEncByKey = new HashMap<>();
+
+        if (segments == null || segments.isEmpty()) {
+            VariableByteEncoder.write(0, outStream);
+            return;
+        }
+
+        // ✅ 新增：全局最小 timestamp（PerB 区块的 base）
+        long baseTimestamp = Long.MAX_VALUE;
+
+        for (FastSegment seg : segments) {
+            int bQ = (int) Math.round(seg.getB() / epsilon);
+            long t = seg.getInitTimestamp();
+            if (t < baseTimestamp) baseTimestamp = t;
+
+            M_HARP.AEnc aEnc = chooseSafeA(seg);
+
+            long aKey = makeAKey(aEnc);
+
+            aEncByKey.putIfAbsent(aKey, aEnc);
+
+            input.computeIfAbsent(bQ, k -> new HashMap<>());
+            input.get(bQ).computeIfAbsent(aKey, k -> new ArrayList<>());
+            input.get(bQ).get(aKey).add(t);
+        }
+
+        VariableByteEncoder.write(input.size(), outStream);
+        if (input.isEmpty()) return;
+
+        // ✅ 写入 baseTimestamp（之后所有 ts 都用 ts-baseTimestamp 的 offset）
+        writeVarLong(baseTimestamp, outStream);
+
+        int previousB = input.firstKey() - globalMinB;
+        VariableByteEncoder.write(previousB, outStream);
+
+        for (Map.Entry<Integer, HashMap<Long, ArrayList<Long>>> bEntry : input.entrySet()) {
+            VariableByteEncoder.write(bEntry.getKey() - globalMinB - previousB, outStream);
+            previousB = bEntry.getKey() - globalMinB;
+
+            HashMap<Long, ArrayList<Long>> aMap = bEntry.getValue();
+            VariableByteEncoder.write(aMap.size(), outStream);
+
+            for (Map.Entry<Long, ArrayList<Long>> aEntry : aMap.entrySet()) {
+                long aKey = aEntry.getKey();
+                M_HARP.AEnc aEnc = aEncByKey.get(aKey);
+
+                // tag: 0=half, 1=float
+writeAEnc(aEnc, outStream);
+
+                ArrayList<Long> tsList = aEntry.getValue();
+                Collections.sort(tsList);
+
+                VariableByteEncoder.write(tsList.size(), outStream);
+
+                // ✅ 写 offset（相对 baseTimestamp），并对 offset 做 delta-coding
+                long prevOff = 0;
+                for (Long ts : tsList) {
+                    long off = ts - baseTimestamp;
+                    if (off < 0) throw new IOException("Negative ts offset in perB");
+                    long d = off - prevOff;
+                    if (d < 0) throw new IOException("Negative offset delta in perB");
+                    writeVarLong(d, outStream);
+                    prevOff = off;
+                }
+            }
+        }
+    }
+
+
+
+    private static void toByteArrayRestSegments(ArrayList<FastSegment> segments, ByteArrayOutputStream outStream) throws IOException {
+        VariableByteEncoder.write(segments.size(), outStream);
+        if (segments.isEmpty()) return;
+
+        long minTimestamp = Long.MAX_VALUE;
+        for (FastSegment s : segments) minTimestamp = Math.min(minTimestamp, s.getInitTimestamp());
+
+        writeVarLong(minTimestamp, outStream); // ✅ VarLong base
+
+        segments.sort(Comparator.comparingDouble(FastSegment::getB));
+        int previousB = (int) Math.round(segments.get(0).getB() / epsilon) - globalMinB;
+        VariableByteEncoder.write(previousB, outStream);
+
+        for (FastSegment s : segments) {
+            int bQ = (int) Math.round(s.getB() / epsilon) - globalMinB;
+            VariableByteEncoder.write(bQ - previousB, outStream);
+            previousB = bQ;
+
+            M_HARP.AEnc aEnc = chooseSafeA(s);
+writeAEnc(aEnc, outStream);
+
+            long dt = s.getInitTimestamp() - minTimestamp;
+            if (dt < 0) throw new IOException("Negative ts offset in rest");
+            writeVarLong(dt, outStream); // ✅ VarLong offset
+        }
+    }
+
+
+
+
+
+
+
+    private static ArrayList<FastSegment> readUnmerged(ByteArrayInputStream inStream) throws IOException {
+        ArrayList<FastSegment> segments = new ArrayList<>();
+        int num = VariableByteEncoder.read(inStream);
+        if (num == 0) return segments;
+
+        long baseTimestamp = readVarLong(inStream); // ✅ VarLong base
+
+        int previousB = VariableByteEncoder.read(inStream);
+
+        for (int i = 0; i < num; i++) {
+            int bQ = VariableByteEncoder.read(inStream) + globalMinB + previousB;
+            previousB = bQ - globalMinB;
+
+            int tag = inStream.read();
+            if (tag < 0) throw new IOException("EOF while reading A tag");
+
+            float a;
+            if (tag == 0) a = halfToFloat(readHalfBits(inStream));
+            else if (tag == 1) a = FloatEncoder.read(inStream);
+            else throw new IOException("Invalid A tag: " + tag);
+
+            long ts = readVarLong(inStream) + baseTimestamp; // ✅ VarLong offset
+            segments.add(new FastSegment(ts, a, (float) (bQ * epsilon)));
+        }
+        return segments;
+    }
+
+
+
+
+
+    private static ArrayList<FastSegment> readMergedPerBSegments(ByteArrayInputStream inStream) throws IOException {
+        ArrayList<FastSegment> segments = new ArrayList<>();
+
+        int numB = VariableByteEncoder.read(inStream);
+        if (numB == 0) return segments;
+
+        // ✅ 新增：读取 baseTimestamp
+        long baseTimestamp = readVarLong(inStream);
+
+        int previousB = VariableByteEncoder.read(inStream);
+
+        for (int i = 0; i < numB; i++) {
+            int bQ = VariableByteEncoder.read(inStream) + globalMinB + previousB;
+            previousB = bQ - globalMinB;
+
+            int numA = VariableByteEncoder.read(inStream);
+            for (int j = 0; j < numA; j++) {
+                int tag = inStream.read();
+                if (tag < 0) throw new IOException("EOF while reading A tag");
+
+                float a;
+                if (tag == 0) a = halfToFloat(readHalfBits(inStream));
+                else if (tag == 1) a = FloatEncoder.read(inStream);
+                else throw new IOException("Invalid A tag: " + tag);
+
+                int numTimestamps = VariableByteEncoder.read(inStream);
+
+                long off = 0; // cumulative offset (ts - baseTimestamp)
+                for (int k = 0; k < numTimestamps; k++) {
+                    off += readVarLong(inStream); // ✅ delta of offset
+                    long ts = baseTimestamp + off;
+                    segments.add(new FastSegment(ts, a, (float) (bQ * epsilon)));
+                }
+            }
+        }
+
+        return segments;
+    }
+
+
+    private static ArrayList<FastSegment> readMergedPerASegments(ByteArrayInputStream inStream) throws IOException {
+        ArrayList<FastSegment> segments = new ArrayList<>();
+        int numA = VariableByteEncoder.read(inStream);
+        if (numA == 0) return segments;
+
+        long baseTimestamp = readVarLong(inStream);  // ✅ VarLong base
+
+        for (int i = 0; i < numA; i++) {
+            int tag = inStream.read();
+            if (tag < 0) throw new IOException("EOF while reading A tag");
+
+            float a;
+            if (tag == 0) a = halfToFloat(readHalfBits(inStream));
+            else if (tag == 1) a = FloatEncoder.read(inStream);
+            else throw new IOException("Invalid A tag: " + tag);
+
+            int numBT = VariableByteEncoder.read(inStream);
+            int previousB = VariableByteEncoder.read(inStream);
+
+            for (int j = 0; j < numBT; j++) {
+                int bDelta = VariableByteEncoder.read(inStream);
+                int bQ = bDelta + previousB + globalMinB;
+                previousB = (bQ - globalMinB);
+
+                long ts = readVarLong(inStream) + baseTimestamp;  // ✅ VarLong offset
+                segments.add(new FastSegment(ts, a, (float) (bQ * epsilon)));
+            }
+        }
+        return segments;
+    }
+
+
+
+    // ====== 替换：mergePerB（用 bQ 分组，避免 double 比较；无 lambda）======
+    // ====== 替换：mergePerB（用 bQ 分组，修复 double 比较问题 + 去掉 lambda）======
+    private static void mergePerB(ArrayList<FastSegment> segments, ArrayList<FastSegment> mergedSegments, ArrayList<FastSegment> unmergedSegments) {
+        if (segments == null || segments.isEmpty()) return;
+
+        // 预处理：先利用 chooseSafeA 确定每段的实际 a 值，用于排序和合并
+        segments.sort((s1, s2) -> {
+            int bq1 = (int) Math.round(s1.getB() / epsilon);
+            int bq2 = (int) Math.round(s2.getB() / epsilon);
+            if (bq1 != bq2) return Integer.compare(bq1, bq2);
+
+            float a1 = chooseSafeA(s1).a;
+            float a2 = chooseSafeA(s2).a;
+            return Float.compare(a1, a2);
+        });
+
+        double aMinTemp = -Double.MAX_VALUE;
+        double aMaxTemp = Double.MAX_VALUE;
+        int curBQ = Integer.MIN_VALUE;
+        double curB = Double.NaN;
+        ArrayList<Long> timestamps = new ArrayList<>();
+
+        for (int i = 0; i < segments.size(); i++) {
+            FastSegment s = segments.get(i);
+            int bq = (int) Math.round(s.getB() / epsilon);
+            double bVal = bq * epsilon;
+
+            if (bq != curBQ) {
+                flushPerB(timestamps, mergedSegments, unmergedSegments, aMinTemp, aMaxTemp, curB, curBQ);
+                timestamps.clear();
+                curBQ = bq;
+                curB = bVal;
+                timestamps.add(s.getInitTimestamp());
+                aMinTemp = s.getAMin();
+                aMaxTemp = s.getAMax();
+                continue;
+            }
+
+            // 区间相交判断
+            if (s.getAMin() <= aMaxTemp && s.getAMax() >= aMinTemp) {
+                timestamps.add(s.getInitTimestamp());
+                aMinTemp = Math.max(aMinTemp, s.getAMin());
+                aMaxTemp = Math.min(aMaxTemp, s.getAMax());
+            } else {
+                flushPerB(timestamps, mergedSegments, unmergedSegments, aMinTemp, aMaxTemp, curB, curBQ);
+                timestamps.clear();
+                timestamps.add(s.getInitTimestamp());
+                aMinTemp = s.getAMin();
+                aMaxTemp = s.getAMax();
+            }
+        }
+        flushPerB(timestamps, mergedSegments, unmergedSegments, aMinTemp, aMaxTemp, curB, curBQ);
+    }
+
+    // 提取的辅助 Flush 方法，确保逻辑一致
+    private static void flushPerB(ArrayList<Long> ts, List<FastSegment> m, List<FastSegment> u, double amin, double amax, double b, int bq) {
+        if (ts.isEmpty() || bq == Integer.MIN_VALUE) return;
+        if (ts.size() == 1) {
+            u.add(new FastSegment(ts.get(0), amin, amax, b));
+        } else {
+            for (Long t : ts) {
+                m.add(new FastSegment(t, amin, amax, b));
+            }
+        }
+    }
+
+
+     private static ArrayList<FastSegment> stitchChunkBoundariesSafe(
+            List<Point> points,
+            ArrayList<FastSegment> segments,
+            ArrayList<Long> boundaryTimestamps,
+            int lookaheadPoints
+    ) {
+        if (segments == null || segments.size() < 2) return segments;
+        if (boundaryTimestamps == null || boundaryTimestamps.isEmpty()) return segments;
+
+        segments.sort(Comparator.comparingLong(FastSegment::getInitTimestamp));
+
+        for (long boundaryTs : boundaryTimestamps) {
+            int cut = lowerBoundSegmentByTs(segments, boundaryTs);
+            if (cut <= 0 || cut >= segments.size()) continue;
+
+            int prevIdx = cut - 1;
+            int curIdx  = cut;
+            int nextIdx = cut + 1;
+
+            long startTs = segments.get(prevIdx).getInitTimestamp();
+
+            int pStart = indexOfTimestampExact(points, startTs);
+            int pBoundary = indexOfTimestampExact(points, boundaryTs);
+            if (pStart < 0 || pBoundary < 0 || pBoundary <= pStart) continue;
+
+            // 新段最终会被 toPoints 用到 “nextStart-1”
+            long targetEndTs;
+            if (nextIdx < segments.size()) {
+                targetEndTs = segments.get(nextIdx).getInitTimestamp() - 1;
+            } else {
+                targetEndTs = lastTimeStamp;
+            }
+            if (targetEndTs < boundaryTs) continue;
+
+            int pTargetEnd = indexOfTimestamp(points, targetEndTs);
+            if (pTargetEnd <= pBoundary) continue;
+
+            // window 必须至少覆盖到 targetEnd（否则会外推）
+            int minEndExclusive = Math.min(points.size(), pTargetEnd + 1);
+
+            // 额外 lookahead（越大越容易合并成功，但别太大）
+            int suggestedEnd = Math.min(points.size(), pBoundary + lookaheadPoints);
+            int pEndExclusive = Math.max(minEndExclusive, suggestedEnd);
+
+            if (pEndExclusive <= pStart + 1) continue;
+
+            List<Point> win = points.subList(pStart, pEndExclusive);
+
+            M_HARP.BestSegment best = pickBestSegmentAt(0, win, win.size());
+            M_HARP.BestSegment safe = makeSafe(best, 0, win);
+
+            // 必须覆盖到 targetEndTs，否则不替换（避免外推误差越界）
+            long safeCoverEndTs = win.get(safe.fit.endIdx - 1).getTimestamp();
+            if (safeCoverEndTs < targetEndTs) continue;
+
+            // 替换 prev+cur 为一个新段（段数一定变化）
+            segments.subList(prevIdx, curIdx + 1).clear();
+            segments.add(prevIdx, new FastSegment(startTs, safe.fit.aMin, safe.fit.aMax, safe.b));
+
+            segments.sort(Comparator.comparingLong(FastSegment::getInitTimestamp));
+        }
+
+        return segments;
+    }
+
+    // 二分：找第一个 initTimestamp >= ts 的 segment 下标
+    private static int lowerBoundSegmentByTs(ArrayList<FastSegment> segments, long ts) {
+        int lo = 0, hi = segments.size();
+        while (lo < hi) {
+            int mid = (lo + hi) >>> 1;
+            if (segments.get(mid).getInitTimestamp() < ts) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    }
+
+    // stitch 后重算全局最小 bQ（很关键，避免编码偏移导致整体误差）
+    private static int recomputeGlobalMinBQ(ArrayList<FastSegment> segments) {
+        int minBQ = Integer.MAX_VALUE;
+        for (FastSegment s : segments) {
+            int bQ = (int) Math.round(s.getB() / epsilon);
+            if (bQ < minBQ) minBQ = bQ;
+        }
+        return (minBQ == Integer.MAX_VALUE) ? 0 : minBQ;
+    }
+
+    private static byte[] zstdDecompressSafe(byte[] input) throws IOException {
+        long size = Zstd.decompressedSize(input);
+        if (size > 0 && size <= Integer.MAX_VALUE) {
+            return Zstd.decompress(input, (int) size);
+        }
+
+        // fallback：不知道原始大小就指数扩容尝试
+        int cap = Math.max(1024, input.length * 4);
+        for (int i = 0; i < 8; i++) { // 最多尝试 8 次
+            try {
+                return Zstd.decompress(input, cap);
+            } catch (Exception e) {
+                cap = Math.multiplyExact(cap, 2);
+            }
+        }
+        throw new IOException("Zstd decompression failed: unknown original size or corrupted input");
+    }
+
+
+ }
+
